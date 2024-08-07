@@ -1,0 +1,94 @@
+/* 
+What does this Terraform do?
+
+This allows users to automatically create a Cloud CDN configuration that leverages a Global External HTTPS Load Balancer and routes user traffic to a publicly accessible GCS bucket.
+
+1. Creates a new multi-regional bucket based in the US
+2. Sets IAM permissions to make the bucket publicly accessible
+3. Creates a Google-Managed SSL/TLS certificate for a hostname
+4. Creates a Global External HTTPS LB with frontend and backend bucket configurations
+5. Creates a basic URL map that routes any request for any host to the backend bucket
+6. Sets basic caching TTLs
+7. Creates a custom HTTP response header showing cache status
+8. Automatically applies compression (if applicable) to the object requested by the user
+*/
+
+terraform {
+  required_providers {
+    google = {
+      source = "hashicorp/google"
+      version = "5.32.0"
+    }
+  }
+}
+provider "google" {
+  project = "project-name"
+}
+
+# Create GCS bucket
+resource "google_storage_bucket" "default" {
+  force_destroy               = false
+  location                    = "US"
+  name                        = "storage-bucket-name"
+  storage_class               = "STANDARD"
+  uniform_bucket_level_access = true
+}
+
+# Make GCS bucket public
+resource "google_storage_bucket_iam_member" "member" {
+  bucket   = google_storage_bucket.default.name
+  role     = "roles/storage.objectViewer"
+  member   = "allUsers"
+}
+
+# Create Google-Managed SSL Cert
+resource "google_compute_managed_ssl_certificate" "default" {
+  name = "example-certificate-name"
+
+  managed {
+    domains = ["example.com"]
+  }
+}
+
+# Create Target HTTPS Proxy and connect URL map
+resource "google_compute_target_https_proxy" "default" {
+  name     = "https-target-proxy-name"
+  provider = google
+  url_map  = google_compute_url_map.default.id
+  ssl_certificates = [google_compute_managed_ssl_certificate.default.id]
+}
+
+# Create simple URL map routing all traffic to backend bucket
+resource "google_compute_url_map" "default" {
+  name            = "load-balancer-name"
+  provider        = google
+  default_service = google_compute_backend_bucket.default.self_link
+}
+
+# Create LB forwarding rule (frontend configuration)
+resource "google_compute_global_forwarding_rule" "default" {
+  name                  = "forwarding-rule-name"
+  provider              = google
+  ip_protocol           = "TCP"
+  load_balancing_scheme = "EXTERNAL_MANAGED"
+  port_range            = "443"
+  target                = google_compute_target_https_proxy.default.id
+}
+
+# Create backend bucket for LB. 
+# Configure basic CDN TTLs
+# Add a custom response HTTP response header to show cache status.
+resource "google_compute_backend_bucket" "default" {
+  bucket_name = google_storage_bucket.default.name
+  cdn_policy {
+    cache_mode         = "CACHE_ALL_STATIC"
+    client_ttl         = 3600
+    default_ttl        = 3600
+    max_ttl            = 86400
+    request_coalescing = true
+  }
+  compression_mode        = "AUTOMATIC"
+  custom_response_headers = ["x-cdn-cache-status:{cdn_cache_status}"]
+  enable_cdn              = true
+  name                    = "backend-bucket-name"
+}
